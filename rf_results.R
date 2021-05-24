@@ -46,10 +46,11 @@ rf_model <- rand_forest(
 
 # set-up tuning grid ----
 rf_params <- parameters(rf_model) %>% 
-  update(mtry = mtry(range = c(2,20)))
+  update(mtry = mtry(range = c(1,20)),
+         min_n = min_n(range = c(30L, 50L)))
 
 # define tuning grid
-rf_grid <- grid_regular(rf_params, levels = c(3,4))
+rf_grid <- grid_regular(rf_params, levels = 5)
 
 # workflow ----
 rf_workflow <- workflow() %>% 
