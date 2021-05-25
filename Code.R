@@ -3,6 +3,7 @@ library(tidyverse)
 library(tidymodels)
 library(corrr)
 library(ranger)
+library(stacks)
 
 set.seed(123)
 # Load data
@@ -146,21 +147,22 @@ loan_train_vcf %>%
   geom_col() # verification_status can consider ~
 
 # Split data
-loan_folds <- vfold_cv(data = loan_train, v = 5, repeats = 3)
+loan_folds <- vfold_cv(data = loan_train, v = 5, repeats = 3, 
+                       strata = money_made_inv)
 
 # Build recipe
-loan_train_try <-
-  loan_train %>% 
-  select(-earliest_cr_line, emp_title)
-loan_recipe2 <- 
-  recipe(money_made_inv ~ ., data = loan_train_try) %>% 
-  step_zv(all_predictors()) %>% 
-  step_other(addr_state, emp_length, last_credit_pull_d, purpose, sub_grade, 
-             threshold = 0.1, other = "other values") %>% 
-  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
-  step_normalize(all_predictors())
-prep(loan_recipe2) %>% 
-  bake(new_data = NULL)
+# loan_train_try <-
+#   loan_train %>% 
+#   select(-earliest_cr_line, emp_title)
+# loan_recipe2 <- 
+#   recipe(money_made_inv ~ ., data = loan_train_try) %>% 
+#   step_zv(all_predictors()) %>% 
+#   step_other(addr_state, emp_length, last_credit_pull_d, purpose, sub_grade, 
+#              threshold = 0.1, other = "other values") %>% 
+#   step_dummy(all_nominal_predictors(), one_hot = TRUE) %>% 
+#   step_normalize(all_predictors())
+# prep(loan_recipe2) %>% 
+#   bake(new_data = NULL)
 
 loan_recipe <- 
   recipe(money_made_inv ~ loan_amnt + out_prncp_inv + application_type +
@@ -173,6 +175,14 @@ loan_recipe <-
 
 prep(loan_recipe) %>% 
   bake(new_data = NULL)
+loan_recipe2 <- 
+  recipe(money_made_inv ~ loan_amnt + out_prncp_inv + application_type +
+           initial_list_status + term + grade + verification_status, 
+         data = loan_train) %>% 
+  step_interact(loan_amnt ~ out_prncp_inv) %>% 
+  step_dummy(all_nominal_predictors()) %>% 
+  step_zv(all_predictors()) %>% 
+  step_normalize(all_predictors())
 
 # random forest model
 rf_model <- rand_forest(
@@ -217,4 +227,134 @@ rf_final_results <- rf_results %>%
 
 write_csv(rf_final_results, "rf_output.csv")
 
+# knn model
+knn_model <- nearest_neighbor(
+  mode = "regression",
+  neighbors = tune()
+) %>%
+  set_engine("kknn")
 
+# set-up tuning grid ----
+knn_params <- parameters(knn_model) %>%
+  update(neighbors = neighbors(range = c(1,40)))
+
+# define grid
+knn_grid <- grid_regular(knn_params, levels = 15)
+
+# workflow ----
+knn_workflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(loan_recipe2)
+
+knn_tuned <- knn_workflow %>% 
+  tune_grid(loan_folds, knn_grid)
+
+# control settings 
+ctrl_grid <- control_stack_grid()
+ctrl_resample <- control_stack_resamples()
+# Tuning/fitting ----
+knn_res <- knn_workflow %>%
+  tune_grid(
+    resamples = loan_folds,
+    grid = knn_grid,
+    control = ctrl_grid
+  ) 
+# Write out results & workflow
+save(knn_res, file = "knn_res.rda")
+
+# Linear regression model
+lin_reg_model <- linear_reg(
+  mode = "regression",
+) %>%
+  set_engine("lm")
+
+# workflow ----
+lin_reg_workflow <- workflow() %>%
+  add_model(lin_reg_model) %>%
+  add_recipe(loan_recipe2)
+
+# Tuning/fitting ----
+lin_reg_res <- lin_reg_workflow %>%
+  fit_resamples(
+    resamples = loan_folds,
+    control = ctrl_resample
+  )
+# Write out results & workflow
+save(lin_reg_res, file = "lin_reg_res.rda")
+
+# SVM model
+svm_model <- svm_rbf(
+  mode = "regression",
+  cost = tune(),
+  rbf_sigma = tune()
+) %>%
+  set_engine("kernlab")
+
+# set-up tuning grid ----
+svm_params <- parameters(svm_model)
+
+# define grid
+svm_grid <- grid_regular(svm_params, levels = 5)
+
+# workflow ----
+svm_workflow <- workflow() %>%
+  add_model(svm_model) %>%
+  add_recipe(loan_recipe2)
+
+# Tuning/fitting ----
+svm_res <- svm_workflow %>%
+  tune_grid(
+    resamples = loan_folds,
+    grid = svm_grid,
+    control = ctrl_grid
+  )
+
+# Write out results & workflow
+save(svm_res, file = "svm_res.rda")
+
+# Load candidate model info ----
+load("knn_res.rda")
+load("svm_res.rda")
+load("lin_reg_res.rda")
+
+# Create data stack ----
+loan_data_stack <- stacks() %>% 
+  add_candidates(knn_res) %>% 
+  add_candidates(lin_reg_res) %>% 
+  add_candidates(svm_res)
+
+# Fit the stack ----
+# penalty values for blending (set penalty argument when blending)
+blend_penalty <- c(10^(-6:-1), 0.5, 1, 1.5, 2)
+
+loan_model_stack <- loan_data_stack %>% 
+  blend_predictions(penalty = blend_penalty)
+
+# Explore the blended model stack
+autoplot(loan_model_stack) 
+#better to include fewer members to have lower rmse and higher rsq
+autoplot(loan_model_stack, type = "members")
+autoplot(loan_model_stack, type = "weights") 
+select_best(loan_model_stack, metric = "rmse")
+select_best(loan_model_stack, metric = "rsq")
+show_best(loan_model_stack, metric = "rmse")
+show_best(loan_model_stack, metric = "rsq")
+# fit to ensemble to entire training set ----
+loan_st_final <- 
+  loan_model_stack %>% 
+  fit_members()
+
+# Explore and assess trained ensemble model
+collect_parameters(loan_st_final, "svm_res")
+collect_parameters(loan_st_final, "knn_res")
+collect_parameters(loan_st_final, "lin_reg_res")
+
+st_final_results <- loan_st_final %>% 
+  predict(new_data = loan_test) %>% 
+  bind_cols(loan_test %>% select(id)) %>% 
+  select(id, .pred)
+
+write_csv(st_final_results, "st_output.csv")
+
+
+# boosted tree model 

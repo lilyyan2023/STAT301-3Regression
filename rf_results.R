@@ -9,7 +9,8 @@ loan_train <- read_csv("train.csv")
 loan_test <- read_csv("test.csv")
 
 # Split data
-loan_folds <- vfold_cv(data = loan_train, v = 5, repeats = 3)
+loan_folds <- vfold_cv(data = loan_train, v = 5, repeats = 3, 
+                       strata = money_made_inv)
 
 # Build recipe
 loan_recipe <-
@@ -46,8 +47,7 @@ rf_model <- rand_forest(
 
 # set-up tuning grid ----
 rf_params <- parameters(rf_model) %>% 
-  update(mtry = mtry(range = c(1,20)),
-         min_n = min_n(range = c(30L, 50L)))
+  update(mtry = mtry(range = c(1,20)))
 
 # define tuning grid
 rf_grid <- grid_regular(rf_params, levels = 5)
